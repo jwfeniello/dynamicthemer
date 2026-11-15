@@ -1,17 +1,14 @@
 # dynamicthemer
 
-Open PS3 dynamic themes and explore them in 3D in the browser: the animated characters, the scenery,
-and the theme's own script driving it all, the way it plays behind the XMB.
+Tools for PS3 dynamic themes. Point it at a theme `.pkg` (with its `.rap`) or a `.p3t` and it decrypts it,
+pulls out the icons and backgrounds, and turns the 3D background into a glTF file you can open in the
+included browser viewer or in Blender.
 
-Give it a theme package (the `.pkg` with its `.rap`, or a `.p3t`) and it decrypts, unpacks and converts the
-whole thing into a glTF scene, then plays it in a three.js viewer with:
+![LittleBigPlanet 2 dynamic theme in the viewer](docs/images/lbp2-preview.jpg)
 
-- every model, skinned and animated
-- the original theme script running (logo sequences, character expressions, scrolling skies, effects)
-- a **States** panel to jump between the scenes the theme cycles through, and hold any of them
-- per-object visibility toggles, free camera, the theme's own camera, speed control
-
-It also extracts the static parts of a theme (icons, pointers, previews, backgrounds) as PNG.
+The viewer plays the scene with its animations and runs the theme's own script, so logo sequences, face
+swaps and other scripted bits behave like they do on the console. There's also a panel for jumping between
+the states the script cycles through.
 
 ## Setup
 
