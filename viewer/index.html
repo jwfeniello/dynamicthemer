@@ -1,0 +1,290 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dynamic Themer</title>
+<style>
+  :root { --bg:#111; --fg:#ddd; --panel:rgba(0,0,0,.6); }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--fg); font:13px system-ui,sans-serif; overflow:hidden; }
+  #ui { position:fixed; top:8px; left:8px; background:var(--panel); padding:8px 10px; border-radius:6px; max-height:90vh; overflow:auto; }
+  #ui select, #ui button { font:inherit; }
+  #list label { display:block; white-space:nowrap; }
+  #states { margin:6px 0; border-top:1px solid #555; border-bottom:1px solid #555; padding:4px 0; }
+  #states .sm { margin:3px 0; }
+  #states .who { opacity:.7; font-size:11px; max-width:320px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #states .cur { color:#8fd18f; font-weight:600; }
+</style>
+</head>
+<body>
+<div id="ui">
+  <div>
+    <select id="scene">
+    </select>
+    <button id="cam">Theme camera</button>
+    <button id="frame" title="Frame visible objects (F)">Frame</button>
+    <button id="play">Pause</button>
+    <label>speed <input type="range" id="speed" min="0" max="3" step="0.05" value="1" style="width:80px"></label>
+    <span id="clock"></span>
+    <label><input type="checkbox" id="wire"> wire</label>
+    <label><input type="file" id="file" accept=".glb,.gltf"></label>
+  </div>
+  <div id="states"></div>
+  <div id="list"></div>
+</div>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { VSMX } from "./vsmx_vm.js";
+
+// ---- Theme script host (PS3 RAF scripting API, as used by the VSMX scripts) ----
+function vecProxy(init, onSet) {
+  const arr = [...init];
+  return new Proxy(arr, { set(t, k, val) { t[k] = val; if (!isNaN(+k)) onSet(t); return true; } });
+}
+function makeHost(root, actionsByActor, log) {
+  const timers = [];
+  class Actor {
+    constructor(name) {
+      this.name = name;
+      const node = root.getObjectByName(name);
+      const meshes = []; node?.traverse(o => { if (o.isMesh) meshes.push(o); });
+      const mats = meshes.map(m => m.material);
+      const m0 = mats[0];
+      const action = actionsByActor[name];
+      let color = vecProxy(m0 ? [m0.color.r, m0.color.g, m0.color.b, m0.opacity] : [1, 1, 1, 1], applyColor);
+      function applyColor(c) {
+        for (const m of mats) {
+          const a = c[3] ?? 1;
+          m.color.setRGB(c[0], c[1], c[2]); m.opacity = a;
+          const tr = a < 0.999 || !!m.userData.texAlpha;
+          if (m.transparent !== tr) { m.transparent = tr; m.depthWrite = !tr || !!m.userData.texAlpha === false; m.needsUpdate = true; }
+        }
+      }
+      const vecBind = (getV, setV) => {
+        let p = vecProxy(getV(), setV);
+        return { get: () => p, set: v => { p = vecProxy(v, setV); setV(p); } };
+      };
+      const ensureOwnMap = () => mats.forEach(m => { if (m.map && !m.map.userData.own) { m.map = m.map.clone(); m.map.userData.own = true; m.map.needsUpdate = true; } });
+      const props = {
+        enable: { get: () => node ? node.visible : false, set: v => { if (node) node.visible = !!v; } },
+        color: { get: () => color, set: v => { color = vecProxy(v, applyColor); applyColor(color); } },
+        scale: vecBind(() => node ? node.scale.toArray() : [1, 1, 1], s => node?.scale.set(s[0], s[1], s[2])),
+        position: vecBind(() => node ? node.position.toArray() : [0, 0, 0], s => node?.position.set(s[0], s[1], s[2])),
+        uv_offset: vecBind(() => [0, 0], s => { ensureOwnMap(); mats.forEach(m => m.map?.offset.set(s[0], s[1])); }),
+        uv_scale: vecBind(() => [1, -1], s => { ensureOwnMap(); mats.forEach(m => m.map?.repeat.set(s[0], Math.abs(s[1]))); }),
+      };
+      for (const [k, d] of Object.entries(props)) Object.defineProperty(this, k, { ...d, enumerable: true });
+      this.setColor = v => { this.color = v; };
+      this.setScale = v => { this.scale = v; };
+      this.getAnimTime = () => action ? action.time : 0;
+      this.setAnimTime = t => { if (action) action.time = t; };
+    }
+  }
+  class Light { constructor(name) { this.name = name; this.color = [1, 1, 1, 1]; this.position = [0, 0, 0]; this.direction = [0, 0, -1]; this.enable = true; } }
+  class Camera { constructor(name) { this.name = name; this.position = [0, 0, 0]; this.direction = [0, 0, -1]; this.up = [0, 1, 0]; } }
+  function IntervalTimer(interval, fn) { this.interval = interval; this.fn = fn; this.acc = 0; timers.push(this); }
+  function HostDate() { const d = new Date(); this.hours = d.getHours(); this.minutes = d.getMinutes(); this.seconds = d.getSeconds(); }
+  const System = { timer: [], printPerf() {} };
+  const globals = { Actor, Light, Camera, IntervalTimer, Date: HostDate, System, Math, Array, Error, Object, String, Number,
+                    writeln: (...a) => log(a.join("")), undefined: undefined };
+  return { globals, System, timers };
+}
+async function startScript(gltf, root, mixer, actions) {
+  const b64 = gltf.parser.json.extras?.vsmx_base64;
+  if (!b64) return null;
+  const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+  const logs = [];
+  const log = s => { logs.push(s); if (logs.length > 500) logs.shift(); };
+  const host = makeHost(root, actions, log);
+  const vm = new VSMX(bytes, host.globals, { log });
+  try { vm.start(); } catch (e) { log("script start failed: " + (e?.message || e)); }
+  // ---- State machines exposed by the theme script (gblObjects[i].stateInformation[k]) ----
+  // transitionToState(renderSettings, stateInfo, objectGroup, forcedNext) is the script's own
+  // transition routine; passing forcedNext jumps straight to that state with the theme's fades.
+  const machines = () => {
+    const g = vm.g, out = [];
+    (g.gblObjects || []).forEach((obj, i) => (obj?.stateInformation || []).forEach((si, k) => {
+      const actors = Object.keys(obj).filter(x => !isNaN(+x)).map(x => obj[x]?.name).filter(Boolean);
+      const valid = (si.transitionTable || []).map((t, s) => (t && Object.keys(t).length ? s : -1)).filter(s => s >= 0);
+      out.push({ i, k, obj, si, actors, valid });
+    }));
+    return out;
+  };
+  const stateName = s => (vm.g.STATE_NAMES && vm.g.STATE_NAMES[s]) || `state ${s}`;
+  const held = new Set();
+  const goTo = (m, s) => {
+    try { vm.call(vm.g.transitionToState, undefined, [vm.g.gblRenderSettings, m.si, m.obj, s]); }
+    catch (e) { log("goTo failed: " + (e?.message || e)); }
+  };
+  return {
+    vm, host, logs, machines, stateName, goTo, held,
+    tick(dt) {
+      for (const t of host.System.timer) {
+        if (!t || !t.fn) continue;
+        t.acc += dt;
+        let n = 0;
+        while (t.acc >= t.interval && n++ < 8) {
+          t.acc -= t.interval;
+          try { vm.call(t.fn, undefined, []); } catch (e) { log("frame error: " + (e?.message || e)); }
+          // Hold: keep held machines at the start of their scenario so they never time out.
+          for (const m of machines()) if (held.has(`${m.i}.${m.k}`)) m.si.framesThisScene = 1;
+        }
+      }
+    }
+  };
+}
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(devicePixelRatio);
+renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x202028);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 2));
+const dl = new THREE.DirectionalLight(0xffffff, 1.5); dl.position.set(0, 200, 400); scene.add(dl);
+const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 1, 50000);
+const controls = new OrbitControls(camera, renderer.domElement);
+let root = null, themeCam = null;
+const loader = new GLTFLoader();
+
+function useThemeCam() {
+  if (!themeCam) return;
+  themeCam.updateWorldMatrix(true, false);
+  camera.position.setFromMatrixPosition(themeCam.matrixWorld);
+  camera.fov = themeCam.fov; // GLTFLoader already converts yfov to degrees
+  camera.updateProjectionMatrix();
+  controls.target.copy(camera.position).add(new THREE.Vector3(0, 0, -100));
+  controls.update();
+}
+
+let mixer = null, playing = true, globalSpeed = 1, script = null;
+let useScript = !new URLSearchParams(location.search).has("noscript");
+const clock = new THREE.Clock();
+function show(gltf) {
+  if (root) scene.remove(root);
+  root = gltf.scene; scene.add(root);
+  // Draw in scene (actor) order, like a painter's list.
+  root.children.forEach((o, i) => o.traverse(m => {
+    if (!m.isMesh) return;
+    m.renderOrder = i;
+    m.material.userData.texAlpha = m.material.transparent; // BLEND in the glb = texture has real alpha
+  }));
+  mixer = new THREE.AnimationMixer(root);
+  const actions = {};
+  gltf.animations.forEach((clip, i) => {
+    const act = mixer.clipAction(clip);
+    const ex = gltf.parser.json.animations?.[i]?.extras || {};
+    act.timeScale = ex.speed ?? 1;
+    act.setLoop(THREE.LoopRepeat, Infinity).play();
+    actions[clip.name] = act;
+  });
+  window.__clips = gltf.animations.length;
+  script = null;
+  document.getElementById("states").innerHTML = "";
+  if (useScript) startScript(gltf, root, mixer, actions).then(s => { script = s; window.viewer.script = s; buildStatesUI(); });
+  themeCam = gltf.cameras[0] || null;
+  const list = document.getElementById("list"); list.innerHTML = "";
+  root.children.forEach(o => {
+    if (!o.isMesh && !o.children.length) return;
+    const l = document.createElement("label");
+    const c = document.createElement("input"); c.type = "checkbox"; c.checked = true;
+    c.onchange = () => o.visible = c.checked;
+    l.append(c, " " + o.name); list.append(l);
+  });
+  const box = new THREE.Box3().setFromObject(root);
+  const ctr = box.getCenter(new THREE.Vector3()), size = box.getSize(new THREE.Vector3()).length();
+  if (themeCam) useThemeCam();
+  else { controls.target.copy(ctr); camera.position.copy(ctr).add(new THREE.Vector3(0, size * .2, size * .6)); controls.update(); }
+  window.__loaded = root.children.length;
+}
+function buildStatesUI() {
+  const box = document.getElementById("states");
+  box.innerHTML = "";
+  if (!script) return;
+  const ms = script.machines();
+  if (!ms.length) { box.textContent = "No script state machines in this theme."; return; }
+  const head = document.createElement("div"); head.innerHTML = "<b>States</b> (from the theme script)"; box.append(head);
+  for (const m of ms) {
+    const row = document.createElement("div"); row.className = "sm";
+    const sel = document.createElement("select");
+    for (const s of m.valid) { const o = document.createElement("option"); o.value = s; o.textContent = script.stateName(s); sel.append(o); }
+    const cur = document.createElement("span"); cur.className = "cur";
+    const hold = document.createElement("label");
+    const hc = document.createElement("input"); hc.type = "checkbox";
+    hc.onchange = () => { const key = `${m.i}.${m.k}`; hc.checked ? script.held.add(key) : script.held.delete(key); };
+    hold.append(hc, " hold");
+    // Many theme states last a fraction of a second before the script follows `next`, so picking a
+    // state also holds it; untick "hold" to let the theme carry on from there.
+    sel.onchange = () => { script.goTo(m, +sel.value); hc.checked = true; hc.onchange(); refresh(); };
+    const who = document.createElement("div"); who.className = "who";
+    const lens = m.valid.map(s => m.si.transitionTable[s]?.scenarioLen).filter(v => typeof v === "number");
+    const lenTxt = m.valid.length < 2 ? " (single state: continuous effect)"
+      : lens.length ? ` (states last ${Math.min(...lens).toFixed(2)}–${Math.max(...lens).toFixed(2)}s)` : "";
+    who.textContent = `#${m.i}${m.k ? "." + m.k : ""}: ` + m.actors.join(", ") + lenTxt;
+    who.title = who.textContent;
+    const line = document.createElement("div");
+    line.append(cur, " → ", sel, " ", hold);
+    row.append(who, line); box.append(row);
+    const refresh = () => {
+      const s = m.si.currentState;
+      cur.textContent = script.stateName(s);
+      if (document.activeElement !== sel) sel.value = s;
+    };
+    m.refresh = refresh; refresh();
+  }
+  clearInterval(buildStatesUI.timer);
+  buildStatesUI.timer = setInterval(() => ms.forEach(m => m.refresh?.()), 300);
+}
+function frameVisible() {
+  if (!root) return;
+  const box = new THREE.Box3();
+  root.children.forEach(o => { if (o.visible && !o.isCamera) box.expandByObject(o); });
+  if (box.isEmpty()) return;
+  const ctr = box.getCenter(new THREE.Vector3()), size = box.getSize(new THREE.Vector3()).length();
+  controls.target.copy(ctr);
+  camera.position.copy(ctr).add(new THREE.Vector3(0, size * .15, size * 1.1));
+  controls.update();
+}
+addEventListener("keydown", e => { if (e.key === "f") frameVisible(); });
+window.viewer = { THREE, scene, camera, controls, renderer, frameVisible, get root() { return root; },
+  render() { controls.update(); renderer.render(scene, camera); } };
+function load(url) { loader.load(url, show, undefined, e => { document.getElementById("list").textContent = "Load failed: " + e.message; }); }
+document.getElementById("scene").onchange = e => load(e.target.value);
+document.getElementById("cam").onclick = useThemeCam;
+document.getElementById("frame").onclick = frameVisible;
+document.getElementById("wire").onchange = e => root && root.traverse(o => { if (o.isMesh) o.material.wireframe = e.target.checked; });
+document.getElementById("file").onchange = e => { const f = e.target.files[0]; if (f) f.arrayBuffer().then(b => loader.parse(b, "", show)); };
+// Themes built with tools/build_theme.py are listed in themes/index.json.
+fetch("../themes/index.json").then(r => r.ok ? r.json() : []).catch(() => []).then(list => {
+  const sel = document.getElementById("scene");
+  for (const t of list) {
+    const o = document.createElement("option");
+    o.value = "../themes/" + t.path; o.textContent = t.title; sel.append(o);
+  }
+  if (list.length) load(sel.value);
+  else document.getElementById("list").textContent =
+    "No themes built yet. Run tools/build_theme.py, or use Choose File to open a .glb.";
+});
+addEventListener("resize", () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
+document.getElementById("play").onclick = e => { playing = !playing; e.target.textContent = playing ? "Pause" : "Play"; };
+document.getElementById("speed").oninput = e => { globalSpeed = +e.target.value; };
+renderer.setAnimationLoop(() => {
+  const dt = clock.getDelta();
+  if (mixer && playing) { mixer.update(dt * globalSpeed); script?.tick(dt * globalSpeed); }
+  if (mixer) document.getElementById("clock").textContent = mixer.time.toFixed(1) + "s";
+  controls.update(); renderer.render(scene, camera);
+});
+window.viewer.step = (t) => { if (mixer) mixer.update(t); script?.tick(t); };
+window.viewer.setTime = (t) => { if (mixer) mixer.setTime(t); };
+</script>
+</body>
+</html>

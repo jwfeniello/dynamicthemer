@@ -1,0 +1,13 @@
+# Built themes and theme packages (your own content stays local)
+themes/
+*.pkg
+*.rap
+*.p3t
+*.edat
+*.zip
+*.glb
+
+# Python
+__pycache__/
+*.pyc
+.venv/
